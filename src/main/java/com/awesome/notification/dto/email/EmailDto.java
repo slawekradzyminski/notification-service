@@ -1,0 +1,42 @@
+package com.awesome.notification.dto.email;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import java.util.Collections;
+import java.util.Map;
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class EmailDto {
+
+    @Schema(requiredMode = Schema.RequiredMode.REQUIRED, minLength = 1, description = "Email recipient",
+            example = "user@example.com")
+    @NotBlank(message = "Recipient is required")
+    @Email(message = "Invalid email format")
+    private String to;
+
+    @Schema(minLength = 1, pattern = "\\S", description = "Email subject", example = "Important message")
+    @NotBlank(message = "Email subject is required")
+    private String subject;
+
+    @Schema(minLength = 1, pattern = "\\S", description = "Email content", example = "Please read this message carefully")
+    @NotBlank(message = "Email content is required")
+    private String message;
+
+    @Schema(types = {"string", "null"}, description = "Optional template identifier used by downstream consumers; may be null in local outbox payloads")
+    private EmailTemplate template;
+
+    @Schema(description = "Template properties that help the consumer render the message")
+    private Map<String, String> properties;
+
+    public Map<String, String> getProperties() {
+        return properties == null ? Collections.emptyMap() : properties;
+    }
+}

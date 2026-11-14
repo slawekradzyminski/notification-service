@@ -1,0 +1,24 @@
+# JVM tests run on H2 in memory (the H2 driver is test-scoped) in PostgreSQL mode, with the
+# "notification" schema as the connection's default schema like currentSchema on PostgreSQL.
+spring:
+  datasource:
+    url: jdbc:h2:mem:notification-test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;DATABASE_TO_LOWER=TRUE;MODE=PostgreSQL;INIT=CREATE SCHEMA IF NOT EXISTS notification\;SET SCHEMA notification
+    username: sa
+    password: ""
+
+notification:
+  service-token: test-service-token
+  # Scheduled jobs are driven explicitly by the tests, and sends happen in the calling thread.
+  events:
+    enabled: false
+  email:
+    async-dispatch: false
+    retry:
+      enabled: false
+
+webhooks:
+  async-dispatch: false
+  retry:
+    enabled: false
+  import:
+    enabled: false

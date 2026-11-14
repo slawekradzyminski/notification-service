@@ -1,0 +1,325 @@
+name: Publish container image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Prerelease image version matching the Maven snapshot line (for example, 1.0.1-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Validate source and image version
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          actual="$(./mvnw --batch-mode -Dstyle.color=never help:evaluate -Dexpression=project.version -q -DforceStdout)"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "Publishing commit $GITHUB_SHA is not contained in origin/master" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release tag must use vMAJOR.MINOR.PATCH: $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$actual" == *-SNAPSHOT || "$actual" != "$version" ]]; then
+              echo "Tag $GITHUB_REF_NAME requires exact non-snapshot Maven version $version; found $actual" >&2
+              exit 1
+            fi
+          else
+            version="$REQUESTED_VERSION"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z][0-9A-Za-z.-]*$ ]]; then
+              echo "Manual version must be a semantic prerelease such as 1.0.1-rc.1: $version" >&2
+              exit 1
+            fi
+            release_line="${version%%-*}"
+            if [[ "$actual" != "${release_line}-SNAPSHOT" ]]; then
+              echo "Candidate $version requires Maven version ${release_line}-SNAPSHOT; found $actual" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # A tag push releases a squash-merge commit whose git tree is identical to a PR head that already
+  # passed the CI workflow. When any successful CI run tested that exact tree, re-running the same
+  # tests here only delays the release. Manual prereleases and unmatched trees stay fully verified.
+  check-prior-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      verified: ${{ steps.lookup.outputs.verified }}
+    steps:
+      - name: Look for a successful CI run on the same git tree
+        id: lookup
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_WORKFLOW: ci.yml
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          verified=false
+          if [ "$EVENT_NAME" != "push" ]; then
+            echo "Manual prerelease: running the full verification."
+          elif ! tree=$(gh api "repos/$REPO/git/commits/$GITHUB_SHA" --jq .tree.sha) || [ -z "$tree" ]; then
+            echo "::warning::Could not read the tree of $GITHUB_SHA; running the full verification."
+          elif ! runs=$(gh api "repos/$REPO/actions/workflows/$CI_WORKFLOW/runs?status=success&per_page=100" \
+              --jq '.workflow_runs[] | "\(.head_sha) \(.html_url)"'); then
+            echo "::warning::Could not list successful $CI_WORKFLOW runs; running the full verification."
+          else
+            echo "Release commit $GITHUB_SHA has tree $tree."
+            while read -r sha url; do
+              [ -n "$sha" ] || continue
+              if [ "$(gh api "repos/$REPO/git/commits/$sha" --jq .tree.sha 2>/dev/null)" = "$tree" ]; then
+                echo "Tree $tree already passed $CI_WORKFLOW on $sha: $url"
+                echo "Verification skipped: tree \`$tree\` already passed $CI_WORKFLOW in $url" >> "$GITHUB_STEP_SUMMARY"
+                verified=true
+                break
+              fi
+            done < <(awk '!seen[$1]++' <<< "$runs")
+            [ "$verified" = true ] || echo "No successful $CI_WORKFLOW run tested tree $tree; running the full verification."
+          fi
+          echo "verified=$verified" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: [validate, check-prior-verification]
+    if: needs.check-prior-verification.outputs.verified != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Verify application
+        run: ./mvnw --batch-mode verify
+
+      - name: Build native verification container
+        run: docker build --tag notification-service:verification .
+
+      - name: Smoke test native container against Postgres
+        run: scripts/native-smoke.sh notification-service:verification
+
+  # native-image cannot cross-compile and is impractically slow under QEMU, so each platform is built
+  # on a runner of its own architecture, pushed by digest, and merged into one manifest list below.
+  build:
+    needs: [validate, check-prior-verification, verify]
+    # verify is skipped when the same tree already passed ci.yml. !cancelled() lets this job start
+    # despite that skip; a failed, cancelled or otherwise skipped verification still blocks the release.
+    if: >-
+      !cancelled() &&
+      needs.validate.result == 'success' &&
+      needs.check-prior-verification.result == 'success' &&
+      (needs.check-prior-verification.outputs.verified == 'true' || needs.verify.result == 'success')
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+
+      - name: Prepare platform name
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require Docker Hub credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets are required" >&2
+            exit 1
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image labels
+        id: metadata
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            slawekradzyminski/notification-service
+
+      - name: Build and push native image by digest
+        id: build
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          outputs: type=image,"name=ghcr.io/${{ github.repository }},slawekradzyminski/notification-service",push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=native-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=native-${{ env.PLATFORM_PAIR }}
+          sbom: true
+          provenance: mode=max
+
+      # The image that is actually published, booted on its own architecture before the manifest exists.
+      - name: Smoke test the native image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+        run: scripts/native-smoke.sh "$IMAGE"
+
+      - name: Export platform digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [validate, build]
+    # A skipped upstream verify job would otherwise skip this job implicitly.
+    if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download platform digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6.2.0
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            slawekradzyminski/notification-service
+          tags: |
+            type=raw,value=${{ needs.validate.outputs.version }}
+            type=sha,prefix=sha-
+          flavor: |
+            latest=false
+
+      - name: Create and push multi-platform manifest lists
+        id: manifest
+        shell: bash
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          for image in "ghcr.io/${{ github.repository }}" slawekradzyminski/notification-service; do
+            tags=()
+            while IFS= read -r tag; do tags+=(--tag "$tag"); done < <(
+              jq -r --arg image "$image" '.tags[] | select(startswith($image + ":"))' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+            sources=()
+            for digest in *; do sources+=("${image}@sha256:${digest}"); done
+            docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+          done
+          digest="$(docker buildx imagetools inspect "ghcr.io/${{ github.repository }}:${VERSION}" \
+            --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Report manifest digest
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Published notification-service image
+
+          - Version: `${{ needs.validate.outputs.version }}`
+          - Digest: `${{ steps.manifest.outputs.digest }}`
+          - Image: GraalVM native executable (JVM fallback: `Dockerfile.jvm`, not published)
+          - Platforms: `linux/amd64`, `linux/arm64` (built natively per architecture)
+          - Registries: `ghcr.io/${{ github.repository }}`, `slawekradzyminski/notification-service`
+          - Tags: version and commit SHA
+          - Supply chain: SBOM and provenance enabled
+          EOF

@@ -1,0 +1,169 @@
+# Every packaged profile shares one bean graph: both email transports, the Artemis client and the
+# tracing beans are always wired, and profiles and environment variables only change properties.
+# GraalVM native images freeze bean selection at build time.
+spring:
+  application:
+    name: notification-service
+  # PostgreSQL by default; SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD override it.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/testdb?currentSchema=notification
+    username: postgres
+    password: postgres
+    hikari:
+      # Small footprint: the backend's Postgres is shared and memory-capped.
+      maximum-pool-size: 3
+      minimum-idle: 1
+      idle-timeout: 120000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: notification
+  flyway:
+    enabled: true
+    schemas: notification
+    default-schema: notification
+    create-schemas: true
+  # Used only with NOTIFICATION_EMAIL_TRANSPORT=jms; SPRING_ARTEMIS_BROKER_URL / _USER / _PASSWORD override.
+  artemis:
+    mode: native
+    broker-url: tcp://activemq:61616
+    user: admin
+    password: admin
+  jmx:
+    enabled: false
+  main:
+    banner-mode: "off"
+
+server:
+  port: 4005
+  tomcat:
+    threads:
+      max: 20
+      min-spare: 2
+    accept-count: 50
+    max-connections: 200
+  error:
+    include-message: never
+    include-binding-errors: never
+    include-stacktrace: never
+
+backend:
+  base-url: ${BACKEND_BASE_URL:http://localhost:4001}
+  connect-timeout: 2s
+  read-timeout: 10s
+
+notification:
+  # X-Service-Token sent on every call to the backend internal API (JWKS, event feed, webhook export).
+  service-token: ${NOTIFICATION_SERVICE_TOKEN:local-notification-token}
+  # Polls the backend event feed (GET /internal/v1/events) for webhook events and notification.requested.
+  events:
+    enabled: ${NOTIFICATION_EVENTS_ENABLED:true}
+    poll-interval: ${NOTIFICATION_EVENTS_POLL_INTERVAL:PT5S}
+  email:
+    # local-outbox (in memory, GET /api/v1/local/notifications/outbox) or jms (Artemis queue "email").
+    transport: ${NOTIFICATION_EMAIL_TRANSPORT:local-outbox}
+    destination: email
+    max-attempts: 10
+    initial-backoff: PT30S
+    max-backoff: PT30M
+    retry:
+      enabled: ${NOTIFICATION_EMAIL_RETRY_ENABLED:true}
+      interval: PT30S
+    local-outbox:
+      capacity: 500
+      access-key: ${LOCAL_EMAIL_OUTBOX_ACCESS_KEY:}
+
+# User webhooks, with the backend's properties and environment variables (see README).
+webhooks:
+  allow-http: ${WEBHOOKS_ALLOW_HTTP:true}
+  allowed-ports: ${WEBHOOKS_ALLOWED_PORTS:}
+  timeout: ${WEBHOOKS_TIMEOUT:PT5S}
+  max-attempts: ${WEBHOOKS_MAX_ATTEMPTS:8}
+  initial-backoff: ${WEBHOOKS_INITIAL_BACKOFF:PT1M}
+  auto-disable-after: ${WEBHOOKS_AUTO_DISABLE_AFTER:20}
+  max-subscriptions-per-user: ${WEBHOOKS_MAX_SUBSCRIPTIONS_PER_USER:5}
+  max-inboxes-per-user: ${WEBHOOKS_MAX_INBOXES_PER_USER:3}
+  inbox-request-limit: ${WEBHOOKS_INBOX_REQUEST_LIMIT:50}
+  async-dispatch: ${WEBHOOKS_ASYNC_DISPATCH:true}
+  retry:
+    enabled: ${WEBHOOKS_RETRY_ENABLED:true}
+    interval: ${WEBHOOKS_RETRY_INTERVAL:PT30S}
+    initial-delay: ${WEBHOOKS_RETRY_INITIAL_DELAY:PT30S}
+    batch-size: ${WEBHOOKS_RETRY_BATCH_SIZE:20}
+  # Signing secrets are stored encrypted with this key (the backend used its MFA key). Set both on servers.
+  secret-encryption:
+    password: ${WEBHOOKS_SECRET_ENCRYPTION_PASSWORD:local-development-webhook-key-change-me}
+    salt: ${WEBHOOKS_SECRET_ENCRYPTION_SALT:5c0e2a7d9b13f4e8a6c1d0b2e3f49a7c}
+  # One-time import of the backend's subscriptions and inboxes when both tables are empty.
+  import:
+    enabled: ${WEBHOOKS_IMPORT_ENABLED:true}
+    retry-interval: PT1M
+
+security:
+  jwt:
+    # Access tokens are RS256-signed by the backend and verified with the keys it
+    # publishes at /internal/v1/jwks.json; an unknown key id refetches them at most
+    # this often.
+    jwks-refresh-interval: ${JWT_JWKS_REFRESH_INTERVAL:10s}
+  # POST .../test and .../redeliver limits per user, as in the backend (off unless enabled).
+  rate-limit:
+    enabled: ${SECURITY_RATE_LIMIT_ENABLED:false}
+    cache:
+      maximum-size: ${SECURITY_RATE_LIMIT_CACHE_MAXIMUM_SIZE:10000}
+      expire-after-access: ${SECURITY_RATE_LIMIT_CACHE_EXPIRE_AFTER_ACCESS:1h}
+    policies:
+      webhook-test-user:
+        capacity: ${SECURITY_RATE_LIMIT_WEBHOOK_TEST_USER_CAPACITY:10}
+        window: ${SECURITY_RATE_LIMIT_WEBHOOK_TEST_USER_WINDOW:15m}
+      webhook-redeliver-user:
+        capacity: ${SECURITY_RATE_LIMIT_WEBHOOK_REDELIVER_USER_CAPACITY:20}
+        window: ${SECURITY_RATE_LIMIT_WEBHOOK_REDELIVER_USER_WINDOW:15m}
+
+# Tracing (contract section 4): off unless TRACING_ENABLED=true (see TracingConfig).
+tracing:
+  enabled: ${TRACING_ENABLED:false}
+
+management:
+  # Tracing beans are always built (Spring AOT fixes bean conditions at image build time);
+  # tracing.enabled decides at runtime whether anything is sampled and exported.
+  tracing:
+    sampling:
+      # New traces only; a sampled incoming traceparent is always followed. Used only when enabled.
+      probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    propagation:
+      type: w3c
+    baggage:
+      enabled: false
+  opentelemetry:
+    tracing:
+      export:
+        otlp:
+          endpoint: ${TRACING_OTLP_ENDPOINT:http://jaeger:4318/v1/traces}
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,prometheus}
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  # The broker is optional (local outbox by default), so it is not part of application health.
+  health:
+    jms:
+      enabled: false
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+
+logging:
+  level:
+    root: INFO
+  # Human-readable lines carry [traceId,requestId] from the MDC. Servers set
+  # LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs instead: one JSON object per line with
+  # requestId, traceId and spanId as fields.
+  pattern:
+    correlation: "[%X{traceId:-},%X{requestId:-}] "

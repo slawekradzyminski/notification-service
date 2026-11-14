@@ -27,6 +27,12 @@ spring:
     default-schema: notification
     create-schemas: true
   # Used only with NOTIFICATION_EMAIL_TRANSPORT=jms; SPRING_ARTEMIS_BROKER_URL / _USER / _PASSWORD override.
+  # The plain Artemis connection factory: Spring's CachingConnectionFactory hands out JDK proxies that
+  # the native image cannot create without proxy metadata, and emails are rare enough to connect per send.
+  # Fixed at build time (a bean condition), like every bean choice in the native image.
+  jms:
+    cache:
+      enabled: false
   artemis:
     mode: native
     broker-url: tcp://activemq:61616

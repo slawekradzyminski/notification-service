@@ -250,7 +250,12 @@ contains "email body" "$outbox" 'We received your payment of 40.00 USD for order
 emails=$(curl -sf "${auth[@]}" "$base/api/v1/notifications/emails")
 contains "email listed as sent and masked" "$emails" '"status":"SENT","recipientMasked":"s\*\*\*@example.com"'
 expect "outbox is for administrators" "$(status_of "${auth[@]}" "$base/api/v1/local/notifications/outbox")" 403
-feed=$(docker exec "$RUN_ID-backend" grep '^FEED .*after=2&' /tmp/requests.log | tail -n1 || true)
+feed=""
+for _ in $(seq 1 20); do
+  feed=$(docker exec "$RUN_ID-backend" grep '^FEED .*after=2&' /tmp/requests.log 2>/dev/null | tail -n1 || true)
+  [[ -n "$feed" ]] && break
+  sleep 0.5
+done
 contains "feed cursor advanced" "$feed" 'after=2&limit=100&'
 contains "feed asks for webhook types and notification.requested" "$feed" \
   'types=notification.requested,order.cancelled,order.created,order.paid,order.reservation-expired,payment.failed,refund.booked,shipment.delivered,shipment.shipped|'

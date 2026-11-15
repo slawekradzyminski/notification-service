@@ -232,7 +232,7 @@ class EventFeedPollerTest {
         when(duplicate.types()).thenReturn(List.of("other", "card-refund.requested"));
 
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> new EventFeedPoller(backend, cursors, processed,
-                        List.of(handler, duplicate), new InlineTransactionManager(), CLOCK, Spans.disabled(), true))
+                        List.of(handler, duplicate), new InlineTransactionManager(), CLOCK, Spans.disabled(), true, "feed"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("Two feed event handlers for card-refund.requested");
     }
@@ -275,7 +275,7 @@ class EventFeedPollerTest {
 
     private EventFeedPoller poller(boolean enabled) {
         return new EventFeedPoller(backend, cursors, processed, List.of(handler), new InlineTransactionManager(), CLOCK,
-                Spans.disabled(), enabled);
+                Spans.disabled(), enabled, "feed");
     }
 
     static class InlineTransactionManager extends AbstractPlatformTransactionManager {

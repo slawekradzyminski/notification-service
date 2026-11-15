@@ -95,6 +95,26 @@ known ids (`processed_events`), applies the handler, records the id and advances
 unavailable backend or a transient database error ends the run; any other failure is logged and the
 event skipped. Needs backend 3.21.0 (older backends reject the new type names with 400).
 
+## Broker transport (`EVENTS_TRANSPORT=broker`)
+
+The same events can arrive from ActiveMQ Artemis instead of the feed
+(awesome-localstack `docs/EVENT_BROKER_CONTRACT.md`). With
+`notification.events.transport=broker` the poller does not run; a
+`DefaultMessageListenerContainer` (`EventBrokerConfig`, always defined because the native image
+fixes the bean graph, started only in broker mode) reads this service's queue
+`<address>::<address>.notification-service` (address `EVENTS_BROKER_ADDRESS`, default
+`awesome.commerce.events`). Each message body is one feed event; `EventBrokerListener` parses it
+and hands it to `EventFeedPoller#processDelivered`, which runs the same handlers in one
+transaction (webhook deliveries and emails start after its commit), skips event ids already in `processed_events` and leaves the feed cursor alone
+(switching back to the feed resumes from it).
+
+Every failure (a body that does not parse, a malformed event, a handler or database error)
+rolls the JMS session back: Artemis redelivers the message after 1, 2, 4 and 8 seconds and then
+moves it to `DLQ.<queue>`. Nothing is skipped silently, unlike the feed. A valid `traceparent`
+message property (the backend relay's `publish <type>` span) becomes the parent of the
+`process <type>` span. The broker is not part of `/actuator/health`; the listener reconnects
+every 5 seconds.
+
 ## Correlation and tracing
 
 `CorrelationFilter` keeps a valid `X-Request-Id` (or generates one) and puts `requestId`, `traceId` and
@@ -136,6 +156,9 @@ Compose runs `docker,demo` locally and `docker` on the server (no `demo`-specifi
 | `BACKEND_BASE_URL` | `backend.base-url` | `http://localhost:4001` (`http://backend:4001` in `docker`) |
 | `NOTIFICATION_SERVICE_TOKEN` | `notification.service-token` | `local-notification-token`; required in `docker`; `X-Service-Token` on every backend call |
 | `NOTIFICATION_EVENTS_ENABLED` / `_POLL_INTERVAL` | `notification.events.*` | `true` / `PT5S` |
+| `EVENTS_TRANSPORT` | `notification.events.transport` | `feed` (or `broker`: Artemis listener instead of the poller) |
+| `EVENTS_BROKER_ADDRESS` / `EVENTS_BROKER_CONCURRENCY` | `notification.events.broker.address` / `.concurrency` | `awesome.commerce.events` / `1` |
+| `SPRING_ARTEMIS_BROKER_URL` / `_USER` / `_PASSWORD` | `spring.artemis.*` | `tcp://activemq:61616` / `admin` / `admin` (also the `jms` email transport) |
 | `NOTIFICATION_EMAIL_TRANSPORT` | `notification.email.transport` | `local-outbox` (or `jms`) |
 | `NOTIFICATION_EMAIL_RETRY_ENABLED` | `notification.email.retry.enabled` | `true` (every `PT30S`) |
 | `SPRING_ARTEMIS_BROKER_URL` / `_USER` / `_PASSWORD` | `spring.artemis.*` | `tcp://activemq:61616`, `admin`/`admin` (used with `jms`) |

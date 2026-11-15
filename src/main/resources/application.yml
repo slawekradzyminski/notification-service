@@ -26,7 +26,8 @@ spring:
     schemas: notification
     default-schema: notification
     create-schemas: true
-  # Used only with NOTIFICATION_EMAIL_TRANSPORT=jms; SPRING_ARTEMIS_BROKER_URL / _USER / _PASSWORD override.
+  # Used with NOTIFICATION_EMAIL_TRANSPORT=jms and with the broker event transport (EVENTS_TRANSPORT=broker);
+  # SPRING_ARTEMIS_BROKER_URL / _USER / _PASSWORD override.
   # The plain Artemis connection factory: Spring's CachingConnectionFactory hands out JDK proxies that
   # the native image cannot create without proxy metadata, and emails are rare enough to connect per send.
   # Fixed at build time (a bean condition), like every bean choice in the native image.
@@ -64,10 +65,17 @@ backend:
 notification:
   # X-Service-Token sent on every call to the backend internal API (JWKS, event feed, webhook export).
   service-token: ${NOTIFICATION_SERVICE_TOKEN:local-notification-token}
-  # Polls the backend event feed (GET /internal/v1/events) for webhook events and notification.requested.
+  # Receives webhook events and notification.requested from the backend: by polling the event feed
+  # (GET /internal/v1/events, transport feed) or from this service's Artemis queue (transport broker,
+  # docs/EVENT_BROKER_CONTRACT.md in awesome-localstack).
   events:
     enabled: ${NOTIFICATION_EVENTS_ENABLED:true}
+    transport: ${EVENTS_TRANSPORT:feed}
     poll-interval: ${NOTIFICATION_EVENTS_POLL_INTERVAL:PT5S}
+    broker:
+      # Multicast address of the backend's events; this service reads <address>::<address>.notification-service.
+      address: ${EVENTS_BROKER_ADDRESS:awesome.commerce.events}
+      concurrency: ${EVENTS_BROKER_CONCURRENCY:1}
   email:
     # local-outbox (in memory, GET /api/v1/local/notifications/outbox) or jms (Artemis queue "email").
     transport: ${NOTIFICATION_EMAIL_TRANSPORT:local-outbox}
@@ -156,7 +164,7 @@ management:
     health:
       probes:
         enabled: true
-  # The broker is optional (local outbox by default), so it is not part of application health.
+  # The broker is optional (local outbox and feed transport by default), so it is not part of application health.
   health:
     jms:
       enabled: false

@@ -39,6 +39,10 @@ import java.util.Map;
  * (a real tracing span when tracing is on), and the MDC holds the event's {@code requestId} and
  * {@code traceId}, so the webhook deliveries and emails it queues log, store and send the trace of the
  * backend request that wrote the event.
+ *
+ * <p>With {@code notification.events.transport=broker} the poller does not run: {@link EventBrokerListener}
+ * hands every event to {@link #processDelivered}, which deduplicates by event id only and leaves the
+ * cursor where the feed left it, so switching back to the feed resumes from there.
  */
 @Slf4j
 @Component
@@ -62,7 +66,8 @@ public class EventFeedPoller {
     public EventFeedPoller(BackendClient backendClient, EventCursorRepository cursors,
                            ProcessedEventRepository processedEvents, List<FeedEventHandler> handlers,
                            PlatformTransactionManager transactionManager, Clock clock, Spans spans,
-                           @Value("${notification.events.enabled:true}") boolean enabled) {
+                           @Value("${notification.events.enabled:true}") boolean enabled,
+                           @Value("${notification.events.transport:feed}") String transport) {
         this.backendClient = backendClient;
         this.cursors = cursors;
         this.processedEvents = processedEvents;
@@ -80,7 +85,8 @@ public class EventFeedPoller {
         this.transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.clock = clock;
         this.spans = spans;
-        this.enabled = enabled;
+        // With the broker transport the listener receives the events; the poller stays off.
+        this.enabled = enabled && EventTransport.from(transport) == EventTransport.FEED;
     }
 
     @Scheduled(fixedDelayString = "${notification.events.poll-interval:PT5S}",
@@ -123,6 +129,47 @@ public class EventFeedPoller {
         Long sequence = transaction.execute(status -> cursors.findById(CONSUMER)
                 .map(EventCursorEntity::getLastSequence).orElse(0L));
         return sequence == null ? 0L : sequence;
+    }
+
+    /**
+     * Handles one event delivered by the broker, in its own transaction: an event id already in
+     * {@code processed_events} is skipped, anything else goes to its handler and is recorded (webhook
+     * deliveries and emails start after the commit). Unlike the poller nothing is skipped on failure and
+     * the cursor is not used (broker deliveries are not in sequence order once one is redelivered): every
+     * exception propagates, so the broker redelivers the message and finally dead-letters it.
+     *
+     * @return false when the event was a duplicate or of a type no handler consumes
+     */
+    public boolean processDelivered(FeedEvent event) {
+        try (Spans.Scope span = spans.start("process " + event.type(), Span.Kind.CONSUMER,
+                Correlation.validRequestId(event.requestId()), event.traceId(), event.spanId())) {
+            try {
+                Boolean handled = transaction.execute(status -> {
+                    if (processedEvents.existsById(event.id())) {
+                        log.info("Event {} ({} #{}) was already processed; duplicate delivery acknowledged",
+                                event.id(), event.type(), event.sequence());
+                        return false;
+                    }
+                    FeedEventHandler handler = handlers.get(event.type());
+                    if (handler == null) {
+                        log.warn("Event {} has unhandled type {}; acknowledged without effect", event.id(), event.type());
+                        return false;
+                    }
+                    handler.handle(event);
+                    markProcessed(event);
+                    return true;
+                });
+                if (Boolean.TRUE.equals(handled)) {
+                    log.info("Handled event {} ({} #{}) from the broker", event.id(), event.type(), event.sequence());
+                }
+                return Boolean.TRUE.equals(handled);
+            } catch (RuntimeException e) {
+                span.error(e);
+                log.warn("Event {} ({} #{}) failed; the broker will redeliver it: {}", event.id(), event.type(),
+                        event.sequence(), e.getMessage());
+                throw e;
+            }
+        }
     }
 
     /** Handles one event; false when it must be retried later (transient failure). */

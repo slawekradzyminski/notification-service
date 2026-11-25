@@ -5,6 +5,7 @@ import com.awesome.notification.client.BackendErrorMapper;
 import com.awesome.notification.client.BackendException;
 import com.awesome.notification.client.EventFeedPage;
 import com.awesome.notification.client.FeedEvent;
+import com.awesome.notification.controller.exception.CustomException;
 import com.awesome.notification.entity.EventCursorEntity;
 import com.awesome.notification.entity.ProcessedEventEntity;
 import com.awesome.notification.repository.EventCursorRepository;
@@ -12,13 +13,24 @@ import com.awesome.notification.repository.ProcessedEventRepository;
 import com.awesome.notification.tracing.Spans;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.dao.QueryTimeoutException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.orm.jpa.JpaSystemException;
+import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionSystemException;
+import tools.jackson.core.exc.StreamReadException;
 import org.springframework.http.HttpStatus;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 import org.springframework.transaction.support.DefaultTransactionStatus;
 
+import java.sql.SQLTransientConnectionException;
 import java.time.Clock;
+import java.time.format.DateTimeParseException;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -26,6 +38,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -35,6 +48,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -75,6 +89,120 @@ class EventFeedPollerTest {
         assertThat(cursor.getLastSequence()).isZero();
         assertThat(processedIds).isEmpty();
         verify(handler, never()).handle(second);
+    }
+
+    @Test
+    void droppedConnectionKeepsCursor() {
+        FeedEvent created = event(1, "card-refund.requested");
+        feed(new EventFeedPage(List.of(created), 1, false));
+        doThrow(new DataAccessResourceFailureException("Unable to acquire JDBC Connection"))
+                .doNothing()
+                .when(handler).handle(created);
+        EventFeedPoller poller = poller(true);
+
+        assertThat(poller.poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
+        assertThat(processedIds).isEmpty();
+
+        assertThat(poller.poll()).isEqualTo(1);
+
+        verify(handler, times(2)).handle(created);
+        assertThat(cursor.getLastSequence()).isEqualTo(1);
+        assertThat(processedIds).containsExactly(created.id());
+    }
+
+    static Stream<RuntimeException> infrastructureFailures() {
+        return Stream.of(
+                new DataAccessResourceFailureException("connection reset"),
+                new CannotCreateTransactionException("Could not open JPA EntityManager for transaction"),
+                new CannotGetJdbcConnectionException("Failed to obtain JDBC Connection"),
+                new JpaSystemException(new RuntimeException("connection closed")),
+                new TransactionSystemException("Could not commit JPA transaction"),
+                new QueryTimeoutException("statement timeout"),
+                new IllegalArgumentException("wrapped", new SQLTransientConnectionException("pool exhausted")),
+                new jakarta.persistence.PersistenceException("connection lost"),
+                new CustomException("Database unavailable", HttpStatus.SERVICE_UNAVAILABLE),
+                new IllegalStateException("unexpected"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("infrastructureFailures")
+    void aFailureOutsideTheEventKeepsTheCursorAndStopsThePoll(RuntimeException failure) {
+        FeedEvent stuck = event(1, "card-refund.requested");
+        FeedEvent next = event(2, "card-refund.requested");
+        feed(new EventFeedPage(List.of(stuck, next), 2, false));
+        doThrow(failure).when(handler).handle(stuck);
+
+        assertThat(poller(true).poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
+        assertThat(processedIds).isEmpty();
+        verify(handler, never()).handle(next);
+    }
+
+    static Stream<RuntimeException> poisonFailures() {
+        return Stream.of(
+                new IllegalArgumentException("notification.requested event has no recipientEmail"),
+                new NumberFormatException("For input string: \"x\""),
+                new StreamReadException(null, "Unexpected character"),
+                new DateTimeParseException("bad date", "yesterday", 0),
+                new CustomException("properties.orderId is required for ORDER_CONFIRMED", HttpStatus.BAD_REQUEST),
+                new DataIntegrityViolationException("value too long for type character varying(255)"),
+                new org.springframework.dao.DuplicateKeyException("duplicate key value violates unique constraint"),
+                new TransactionSystemException("Could not commit JPA transaction",
+                        new DataIntegrityViolationException("check constraint violated")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("poisonFailures")
+    void aPoisonEventIsStillSkipped(RuntimeException failure) {
+        FeedEvent poison = event(1, "card-refund.requested");
+        FeedEvent next = event(2, "card-refund.requested");
+        feed(new EventFeedPage(List.of(poison, next), 2, false));
+        doThrow(failure).when(handler).handle(poison);
+
+        assertThat(poller(true).poll()).isEqualTo(2);
+
+        assertThat(processedIds).containsExactly(poison.id(), next.id());
+        assertThat(cursor.getLastSequence()).isEqualTo(2);
+    }
+
+    @Test
+    void aFailedCommitKeepsTheCursor() {
+        FeedEvent first = event(1, "card-refund.requested");
+        feed(new EventFeedPage(List.of(first), 1, false));
+        InlineTransactionManager failingCommit = new InlineTransactionManager() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            protected void doCommit(DefaultTransactionStatus status) {
+                if (!processedIds.isEmpty()) {
+                    // the data written in this transaction is lost with the connection
+                    processedIds.clear();
+                    cursor.setLastSequence(0);
+                    throw new TransactionSystemException("Could not commit JPA transaction");
+                }
+            }
+        };
+
+        assertThat(new EventFeedPoller(backend, cursors, processed, List.of(handler), failingCommit, CLOCK,
+                Spans.disabled(), true, "feed").poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
+        assertThat(processedIds).isEmpty();
+    }
+
+    @Test
+    void whenAPoisonEventCannotBeRecordedThePollStopsWithoutMovingTheCursor() {
+        FeedEvent poison = event(1, "card-refund.requested");
+        feed(new EventFeedPage(List.of(poison), 1, false));
+        doThrow(new IllegalArgumentException("malformed")).when(handler).handle(poison);
+        doThrow(new DataAccessResourceFailureException("connection reset")).when(processed).save(any());
+
+        assertThat(poller(true).poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
     }
 
     @Test

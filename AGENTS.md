@@ -23,7 +23,8 @@ documentation, code comments, test names, commit messages and handoff notes.
 - `RestBackendClientContractTest` pins the internal-API requests (JWKS, event feed, webhook export).
 - Event feed handling: one local transaction per event (handle, record in `processed_events`,
   advance `event_cursors`); handlers implement `FeedEventHandler`, are idempotent, and register
-  sends as after-commit work. Transient failures leave the cursor; others skip the event.
+  sends as after-commit work. Only poison events (malformed content or a constraint violation, `EventFailures`) are skipped;
+  database, transaction, backend-outage and unexpected failures leave the cursor for the next poll.
 - Outboxes follow ADR 3 (emails) or keep the backend's documented webhook policy (deliveries).
 - Correlation and tracing: `CorrelationFilter` and `Spans` own the MDC keys `requestId`/`traceId`/
   `spanId`; work outside a request (feed events, deliveries, emails) runs in a `Spans.start(...)`

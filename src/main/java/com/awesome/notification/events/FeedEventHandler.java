@@ -7,9 +7,10 @@ import java.util.List;
 /**
  * Handles event types of the backend feed. Runs inside the poller's per-event transaction, so it
  * must not commit on its own (work after the commit is registered as a transaction synchronization).
- * Throwing a non-transient exception skips the event; a
- * {@link org.springframework.dao.TransientDataAccessException} or a transient
- * {@link com.awesome.notification.client.BackendException} leaves it for the next poll.
+ * Only a poison event is skipped: throw an {@link IllegalArgumentException} when the event's own content
+ * cannot be handled. Database and transaction failures, a transient
+ * {@link com.awesome.notification.client.BackendException} and any other unexpected exception leave the
+ * event for the next poll (see {@link EventFailures}).
  */
 public interface FeedEventHandler {
 

@@ -13,7 +13,6 @@ import com.awesome.notification.tracing.Spans;
 import io.micrometer.tracing.Span;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.TransientDataAccessException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -31,9 +30,11 @@ import java.util.Map;
  * asking only for the types a {@link FeedEventHandler} consumes. Each event is handled in its own
  * transaction that also records it in {@code processed_events} and advances the cursor, so a crash
  * never loses or repeats an event. An event id seen before is skipped. The backend being
- * unavailable (or a transient database failure) stops the poll without moving the cursor; the next
- * tick retries. Any other handler failure is logged with the event id and the event is skipped,
- * so one bad event never blocks the feed. Scheduled every {@code notification.events.poll-interval},
+ * unavailable, any database or transaction failure (a dropped connection, a pool or query timeout, a
+ * failed commit) or any other unexpected failure stops the poll without moving the cursor; the next
+ * tick retries. Only a poison event, one whose own content can never be handled
+ * ({@link EventFailures#isPoison}), is logged with its id and skipped, so one bad event never blocks the
+ * feed. Scheduled every {@code notification.events.poll-interval},
  * switched off with {@code notification.events.enabled}. Each event is handled in a
  * {@code process <type>} CONSUMER span whose parent is the event's {@code traceId}/{@code spanId}
  * (a real tracing span when tracing is on), and the MDC holds the event's {@code requestId} and
@@ -172,7 +173,7 @@ public class EventFeedPoller {
         }
     }
 
-    /** Handles one event; false when it must be retried later (transient failure). */
+    /** Handles one event; false when it must be retried later (any failure that is not a poison event). */
     private boolean process(FeedEvent event) {
         try (Spans.Scope ignored = spans.start("process " + event.type(), Span.Kind.CONSUMER,
                 Correlation.validRequestId(event.requestId()),
@@ -199,35 +200,37 @@ public class EventFeedPoller {
                 advance(cursor, event.sequence());
             });
             return true;
-        } catch (TransientDataAccessException e) {
-            log.warn("Event {} (sequence {}) hit a transient database failure; retrying on the next poll: {}",
-                    event.id(), event.sequence(), e.getMessage());
-            return false;
-        } catch (BackendException e) {
-            if (e.isTransient()) {
-                log.warn("Event {} (sequence {}) needs the backend, which is unavailable; retrying on the next poll",
-                        event.id(), event.sequence());
-                return false;
-            }
-            skip(event, e);
-            return true;
         } catch (RuntimeException e) {
-            skip(event, e);
-            return true;
+            if (EventFailures.isPoison(e)) {
+                return skip(event, e);
+            }
+            log.warn("Event {} (sequence {}, type {}) failed for a reason outside the event (database, transaction "
+                            + "or backend); the cursor stays and the next poll retries it: {}", event.id(),
+                    event.sequence(), event.type(), String.valueOf(e));
+            return false;
         }
     }
 
-    /** Records a failed event as processed and moves past it; the failure is only logged. */
-    private void skip(FeedEvent event, RuntimeException failure) {
-        log.error("Event {} (sequence {}, type {}) failed and is skipped", event.id(), event.sequence(), event.type(),
-                failure);
-        transaction.executeWithoutResult(status -> {
-            EventCursorEntity cursor = lockedCursor();
-            if (!processedEvents.existsById(event.id())) {
-                markProcessed(event);
-            }
-            advance(cursor, event.sequence());
-        });
+    /**
+     * Records a poison event as processed and moves past it; the failure is only logged. False (stop the
+     * poll, cursor unchanged) when even that fails.
+     */
+    private boolean skip(FeedEvent event, RuntimeException failure) {
+        log.error("Event {} (sequence {}, type {}) cannot be handled and is skipped", event.id(), event.sequence(),
+                event.type(), failure);
+        try {
+            transaction.executeWithoutResult(status -> {
+                EventCursorEntity cursor = lockedCursor();
+                if (!processedEvents.existsById(event.id())) {
+                    markProcessed(event);
+                }
+                advance(cursor, event.sequence());
+            });
+            return true;
+        } catch (RuntimeException e) {
+            log.warn("Could not record skipped event {}; the next poll retries it: {}", event.id(), String.valueOf(e));
+            return false;
+        }
     }
 
     /** Moves the cursor past events the backend filtered out of the page. */

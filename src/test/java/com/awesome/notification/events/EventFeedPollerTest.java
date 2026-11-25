@@ -120,7 +120,6 @@ class EventFeedPollerTest {
                 new JpaSystemException(new RuntimeException("connection closed")),
                 new TransactionSystemException("Could not commit JPA transaction"),
                 new QueryTimeoutException("statement timeout"),
-                new DataIntegrityViolationException("duplicate key"),
                 new IllegalArgumentException("wrapped", new SQLTransientConnectionException("pool exhausted")),
                 new jakarta.persistence.PersistenceException("connection lost"),
                 new CustomException("Database unavailable", HttpStatus.SERVICE_UNAVAILABLE),
@@ -148,7 +147,11 @@ class EventFeedPollerTest {
                 new NumberFormatException("For input string: \"x\""),
                 new StreamReadException(null, "Unexpected character"),
                 new DateTimeParseException("bad date", "yesterday", 0),
-                new CustomException("properties.orderId is required for ORDER_CONFIRMED", HttpStatus.BAD_REQUEST));
+                new CustomException("properties.orderId is required for ORDER_CONFIRMED", HttpStatus.BAD_REQUEST),
+                new DataIntegrityViolationException("value too long for type character varying(255)"),
+                new org.springframework.dao.DuplicateKeyException("duplicate key value violates unique constraint"),
+                new TransactionSystemException("Could not commit JPA transaction",
+                        new DataIntegrityViolationException("check constraint violated")));
     }
 
     @ParameterizedTest

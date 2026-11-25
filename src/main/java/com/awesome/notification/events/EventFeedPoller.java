@@ -33,7 +33,7 @@ import java.util.Map;
  * unavailable, any database or transaction failure (a dropped connection, a pool or query timeout, a
  * failed commit) or any other unexpected failure stops the poll without moving the cursor; the next
  * tick retries. Only a poison event, one whose own content can never be handled
- * ({@link EventFailures#isPoison}), is logged with its id and skipped, so one bad event never blocks the
+ * ({@link EventFailures#classify}), is logged with its id and skipped, so one bad event never blocks the
  * feed. Scheduled every {@code notification.events.poll-interval},
  * switched off with {@code notification.events.enabled}. Each event is handled in a
  * {@code process <type>} CONSUMER span whose parent is the event's {@code traceId}/{@code spanId}
@@ -201,12 +201,16 @@ public class EventFeedPoller {
             });
             return true;
         } catch (RuntimeException e) {
-            if (EventFailures.isPoison(e)) {
-                return skip(event, e);
+            switch (EventFailures.classify(e)) {
+                case POISON -> {
+                    return skip(event, e);
+                }
+                case INFRASTRUCTURE -> log.warn("Event {} (sequence {}, type {}) failed for a reason outside the "
+                                + "event (database, transaction or backend); the cursor stays and the next poll "
+                                + "retries it: {}", event.id(), event.sequence(), event.type(), String.valueOf(e));
+                case UNEXPECTED -> log.error("Event {} (sequence {}, type {}) failed unexpectedly; the cursor stays "
+                        + "and the next poll retries it", event.id(), event.sequence(), event.type(), e);
             }
-            log.warn("Event {} (sequence {}, type {}) failed for a reason outside the event (database, transaction "
-                            + "or backend); the cursor stays and the next poll retries it: {}", event.id(),
-                    event.sequence(), event.type(), String.valueOf(e));
             return false;
         }
     }

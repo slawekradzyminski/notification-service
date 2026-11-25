@@ -94,8 +94,9 @@ transaction per event locks the cursor row (`event_cursors`, consumer `notificat
 known ids (`processed_events`), applies the handler, records the id and advances the cursor. An
 unavailable backend, any database or transaction error (a dropped connection, a pool or query timeout,
 a failed commit) or any other unexpected failure ends the run with the cursor unchanged, so the next run
-retries the event. Only a poison event (malformed data: `IllegalArgumentException`, a JSON parse error,
-a backend 4xx, a missing template property) is logged and skipped. Needs backend 3.21.0 (older backends reject the new type names with 400).
+retries the event (unexpected failures are logged at ERROR with their stack trace). Only a poison event
+(malformed data: `IllegalArgumentException`, a JSON parse error, a backend 4xx, a missing template
+property, a constraint violation such as a duplicate key) is logged at ERROR and skipped. Needs backend 3.21.0 (older backends reject the new type names with 400).
 
 ## Broker transport (`EVENTS_TRANSPORT=broker`)
 
